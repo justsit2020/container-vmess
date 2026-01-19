@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eu
+(set -o pipefail) 2>/dev/null && set -o pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$APP_DIR"
@@ -110,3 +111,4 @@ else
   # mkdir 模式下不 exec：保证脚本退出时能清理锁目录（trap 生效）
   node "$MAIN_FILE"
 fi
+

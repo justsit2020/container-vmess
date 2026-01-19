@@ -1,456 +1,321 @@
-#!/usr/bin/env node
 'use strict';
 
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
-const crypto = require('crypto');
+const http = require('http');
+const net = require('net');
 const https = require('https');
-const { spawn, spawnSync } = require('child_process');
+const { spawn } = require('child_process');
+const { WebSocketServer } = require('ws');
 
-process.umask(0o077);
+/** ====== 你需要改的配置 ====== **/
+const UUID = 'e0d103e8-a108-407f-9ec9-1c5368128833'; // 改成你自己的 UUID
+const NAME = 'cf-vless';                             // 节点名称
+const WS_PATH = '/ws-node';                               // WS 路径（保持以 / 开头）
+/** ============================ **/
 
-const PORT = process.env.PORT ? Number(process.env.PORT) : 7681; // 只需要改这里：也可用环境变量 PORT 覆盖
-const SNI_HOST = 'www.bing.com'; // 固定 SNI
+// 面板给你的唯一端口
+const PORT = parseInt(process.env.SERVER_PORT || process.env.PORT || '7681', 10);
 
-const BASE_DIR = '/home/container/.hy2';
-const BIN = path.join(BASE_DIR, 'hysteria');
-const CONF = path.join(BASE_DIR, 'config.yaml');
-const STATE = path.join(BASE_DIR, 'state.env');
-const CERT = path.join(BASE_DIR, 'cert.pem');
-const KEY = path.join(BASE_DIR, 'key.pem');
-const NODEFILE = path.join(BASE_DIR, 'node.txt');
-const LOG = path.join(BASE_DIR, 'hysteria.log');
-const LOCKFILE = path.join(BASE_DIR, 'runner.lock');
+// 订阅路径
+const SUB_PATH = '/sub';        // Base64（V2RayN风格）
+const RAW_PATH = '/sub.txt';    // 明文
+const CLASH_PATH = '/clash';    // Clash.Meta YAML
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+// cloudflared 位置与下载源（amd64）
+const BIN_DIR = path.join(process.cwd(), 'bin');
+const CLOUDFLARED_PATH = path.join(BIN_DIR, 'cloudflared');
+const CLOUDFLARED_URL =
+  'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64';
+
+function uuidToBytes(uuid) {
+  const hex = uuid.replace(/-/g, '').toLowerCase();
+  if (!/^[0-9a-f]{32}$/.test(hex)) throw new Error('UUID 格式不正确');
+  return Buffer.from(hex, 'hex');
+}
+const UUID_BYTES = uuidToBytes(UUID);
+
+function safeMkdirp(dir) {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
-function fatal(msg) {
-  log(`[fatal] ${msg}`);
-  // 模拟 bash 的 tail -f /dev/null：保持进程在线避免面板误判
-  // eslint-disable-next-line no-empty-function
-  return new Promise(() => {});
-}
-
-function isProcessAlive(pid) {
-  if (!pid || !Number.isFinite(pid)) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function ensureDir(p) {
-  fs.mkdirSync(p, { recursive: true, mode: 0o700 });
-}
-
-function writeFileSecure(filePath, content, mode = 0o600) {
-  fs.writeFileSync(filePath, content, { mode });
-}
-
-function readTextIfExists(filePath) {
-  try {
-    return fs.readFileSync(filePath, 'utf8');
-  } catch {
-    return '';
-  }
-}
-
-function hasExecutable(filePath) {
-  try {
-    fs.accessSync(filePath, fs.constants.X_OK);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function opensslAvailable() {
-  const r = spawnSync('openssl', ['version'], { stdio: 'ignore' });
-  return r.status === 0;
-}
-
-function runOpenSSL(args, opts = {}) {
-  const r = spawnSync('openssl', args, {
-    encoding: 'utf8',
-    ...opts,
-  });
-  return r;
-}
-
-async function fetchText(url) {
-  return new Promise((resolve) => {
-    const request = (u, redirectsLeft = 5) => {
-      https
-        .get(u, (res) => {
-          // handle redirects
-          if (
-            res.statusCode &&
-            res.statusCode >= 300 &&
-            res.statusCode < 400 &&
-            res.headers.location &&
-            redirectsLeft > 0
-          ) {
-            res.resume();
-            return request(res.headers.location, redirectsLeft - 1);
-          }
-
-          if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
-            res.resume();
-            return resolve('');
-          }
-
-          let data = '';
-          res.setEncoding('utf8');
-          res.on('data', (chunk) => (data += chunk));
-          res.on('end', () => resolve(data.trim()));
-        })
-        .on('error', () => resolve(''));
-    };
-
-    request(url);
-  });
-}
-
-async function downloadToFile(url, destPath, mode = 0o700) {
-  await new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(destPath, { mode: 0o600 }); // 先落地为 600，再 chmod 到 700
-    const request = (u, redirectsLeft = 5) => {
-      https
-        .get(u, (res) => {
-          if (
-            res.statusCode &&
-            res.statusCode >= 300 &&
-            res.statusCode < 400 &&
-            res.headers.location &&
-            redirectsLeft > 0
-          ) {
-            res.resume();
-            return request(res.headers.location, redirectsLeft - 1);
-          }
-
-          if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
-            res.resume();
-            file.close(() => reject(new Error(`HTTP ${res.statusCode || 'ERR'}`)));
-            return;
-          }
-
-          res.pipe(file);
-          file.on('finish', () => file.close(resolve));
-        })
-        .on('error', (err) => {
-          try {
-            file.close(() => {});
-          } catch {}
-          reject(err);
+function downloadWithRedirect(url, outPath, maxRedirect = 5) {
+  return new Promise((resolve, reject) => {
+    const doReq = (u, left) => {
+      const req = https.get(u, { headers: { 'User-Agent': 'node' } }, (res) => {
+        if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+          if (left <= 0) return reject(new Error('下载重定向次数过多'));
+          res.resume();
+          return doReq(res.headers.location, left - 1);
+        }
+        if (res.statusCode !== 200) {
+          res.resume();
+          return reject(new Error(`下载失败，HTTP ${res.statusCode}`));
+        }
+        const tmp = outPath + '.tmp';
+        const file = fs.createWriteStream(tmp, { mode: 0o755 });
+        res.pipe(file);
+        file.on('finish', () => {
+          file.close(() => {
+            fs.renameSync(tmp, outPath);
+            fs.chmodSync(outPath, 0o755);
+            resolve();
+          });
         });
+        file.on('error', (e) => {
+          try { fs.unlinkSync(tmp); } catch {}
+          reject(e);
+        });
+      });
+      req.on('error', reject);
+      req.setTimeout(20000, () => req.destroy(new Error('下载超时')));
     };
-    request(url);
+    doReq(url, maxRedirect);
   });
-
-  fs.chmodSync(destPath, mode);
 }
 
-function pickAsset() {
-  const arch = os.arch(); // x64, arm64, arm, ia32, ...
-  if (arch === 'x64') {
-    let cpuinfo = '';
-    try {
-      cpuinfo = fs.readFileSync('/proc/cpuinfo', 'utf8').toLowerCase();
-    } catch {}
-    const hasAvx = cpuinfo.includes(' avx ');
-    return hasAvx ? 'hysteria-linux-amd64-avx' : 'hysteria-linux-amd64';
-  }
-  if (arch === 'arm64') return 'hysteria-linux-arm64';
-  if (arch === 'arm') return 'hysteria-linux-arm';
-  if (arch === 'ia32') return 'hysteria-linux-386';
-
-  // 下面这些在 node 的 os.arch() 里不常见，但保留逻辑口子
-  if (arch === 'riscv64') return 'hysteria-linux-riscv64';
-  if (arch === 's390x') return 'hysteria-linux-s390x';
-
-  return '';
+async function ensureCloudflared() {
+  safeMkdirp(BIN_DIR);
+  if (fs.existsSync(CLOUDFLARED_PATH)) return;
+  console.log(`[init] downloading cloudflared -> ${CLOUDFLARED_PATH}`);
+  await downloadWithRedirect(CLOUDFLARED_URL, CLOUDFLARED_PATH);
 }
 
-// ========= logging (console + file) =========
-ensureDir(BASE_DIR);
-const logStream = fs.createWriteStream(LOG, { flags: 'a', mode: 0o600 });
-function log(line) {
-  const msg = typeof line === 'string' ? line : String(line);
-  process.stdout.write(msg + '\n');
-  logStream.write(msg + '\n');
+function parseTryCloudflareHost(line) {
+  const m = String(line).match(/https:\/\/([a-z0-9-]+)\.trycloudflare\.com/i);
+  return m ? `${m[1]}.trycloudflare.com` : null;
 }
 
-process.on('uncaughtException', (e) => {
-  log(`[uncaughtException] ${e?.stack || e}`);
-});
-process.on('unhandledRejection', (e) => {
-  log(`[unhandledRejection] ${e?.stack || e}`);
-});
+/**
+ * VLESS header minimal parse:
+ * ver(1)=0x00 | uuid(16) | optLen(1) | opt | cmd(1) | port(2) | addrType(1) | addr | payload
+ * response: ver(1)=0x00 | addLen(1)=0x00
+ */
+function tryParseVlessHeader(buf) {
+  if (buf.length < 1 + 16 + 1 + 1 + 2 + 1) return null;
 
-// ========= main =========
-(async () => {
-  if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
-    await fatal(`invalid PORT=${process.env.PORT}`);
-    return;
-  }
+  let p = 0;
+  const ver = buf[p++];
 
-  log(`[init] base_dir=${BASE_DIR} port=${PORT} sni=${SNI_HOST}`);
+  if (ver !== 0x00) throw new Error('VLESS version 不支持');
 
-  // ===== lock (pid file) =====
-  if (fs.existsSync(LOCKFILE)) {
-    const prev = readTextIfExists(LOCKFILE).trim();
-    const prevPid = Number(prev);
-    if (isProcessAlive(prevPid)) {
-      log(`[lock] another runner is active (pid=${prevPid}). keep-alive wait...`);
-      while (isProcessAlive(prevPid)) {
-        await sleep(30_000);
-      }
-      log(`[lock] previous runner exited; continue...`);
-    } else {
-      log('[lock] stale lock found; removing.');
-      try {
-        fs.unlinkSync(LOCKFILE);
-      } catch {}
-    }
-  }
+  const id = buf.subarray(p, p + 16); p += 16;
+  if (!id.equals(UUID_BYTES)) throw new Error('UUID 不匹配');
 
-  writeFileSecure(LOCKFILE, String(process.pid) + '\n', 0o600);
+  const optLen = buf[p++]; 
+  if (buf.length < p + optLen + 1 + 2 + 1) return null;
+  p += optLen;
 
-  const cleanup = () => {
-    try {
-      fs.unlinkSync(LOCKFILE);
-    } catch {}
-    try {
-      logStream.end();
-    } catch {}
-  };
-  process.on('exit', cleanup);
+  const cmd = buf[p++]; // 0x01 TCP
+  const port = buf.readUInt16BE(p); p += 2;
+  const addrType = buf[p++];
 
-  // ===== state (fixed auth + node name) =====
-  if (!fs.existsSync(STATE)) {
-    const AUTH_PASS = crypto.randomBytes(18).toString('hex'); // 36 hex
-    const NODE_NAME = `hy2-${crypto.randomBytes(3).toString('hex')}`;
-    const content = `AUTH_PASS='${AUTH_PASS}'\nNODE_NAME='${NODE_NAME}'\n`;
-    writeFileSecure(STATE, content, 0o600);
-  }
-
-  const stateTxt = readTextIfExists(STATE);
-  const authMatch = stateTxt.match(/AUTH_PASS='([^']+)'/);
-  const nameMatch = stateTxt.match(/NODE_NAME='([^']+)'/);
-  const AUTH_PASS = authMatch?.[1] || '';
-  const NODE_NAME = nameMatch?.[1] || 'hy2-node';
-
-  if (!AUTH_PASS) {
-    await fatal('STATE exists but AUTH_PASS missing');
-    return;
-  }
-
-  // ===== download hysteria binary =====
-  const asset = pickAsset();
-  if (!asset) {
-    await fatal(`unsupported arch: ${os.arch()}`);
-    return;
-  }
-
-  if (!hasExecutable(BIN)) {
-    const url = `https://download.hysteria.network/app/latest/${asset}`;
-    log(`[dl] ${url}`);
-    try {
-      await downloadToFile(url, BIN, 0o700);
-    } catch (e) {
-      await fatal(`download failed: ${e?.message || e}`);
-      return;
-    }
-  }
-
-  // ===== cert generation / validation =====
-  if (!opensslAvailable()) {
-    await fatal('openssl not found; cannot generate/validate cert');
-    return;
-  }
-
-  let needCert = false;
-  if (!fs.existsSync(CERT) || !fs.existsSync(KEY)) {
-    needCert = true;
+  let host;
+  if (addrType === 0x01) { // ipv4
+    if (buf.length < p + 4) return null;
+    host = `${buf[p++]}.${buf[p++]}.${buf[p++]}.${buf[p++]}`;
+  } else if (addrType === 0x02) { // domain
+    if (buf.length < p + 1) return null;
+    const len = buf[p++]; 
+    if (buf.length < p + len) return null;
+    host = buf.subarray(p, p + len).toString('utf8');
+    p += len;
+  } else if (addrType === 0x03) { // ipv6
+    if (buf.length < p + 16) return null;
+    const raw = buf.subarray(p, p + 16); p += 16;
+    const parts = [];
+    for (let i = 0; i < 16; i += 2) parts.push(raw.readUInt16BE(i).toString(16));
+    host = parts.join(':');
   } else {
-    const r = runOpenSSL(['x509', '-in', CERT, '-noout', '-text']);
-    const txt = (r.stdout || '') + (r.stderr || '');
-    if (!txt.includes(`DNS:${SNI_HOST}`)) {
-      log(`[tls] cert SAN does not include DNS:${SNI_HOST}; regenerating.`);
-      needCert = true;
-    }
+    throw new Error('addrType 不支持');
   }
 
-  if (needCert) {
-    log(`[tls] generating self-signed cert with SAN=DNS:${SNI_HOST}`);
+  const payload = buf.subarray(p);
+  return { cmd, host, port, payload };
+}
 
-    // try -addext first (openssl 1.1.1+)
-    const r1 = runOpenSSL(
-      [
-        'req',
-        '-x509',
-        '-newkey',
-        'rsa:2048',
-        '-nodes',
-        '-keyout',
-        KEY,
-        '-out',
-        CERT,
-        '-days',
-        '3650',
-        '-subj',
-        `/CN=${SNI_HOST}`,
-        '-addext',
-        `subjectAltName=DNS:${SNI_HOST}`,
-      ],
-      { stdio: 'ignore' }
-    );
+function buildVlessUri(host) {
+  // 关键：把 host + sni 都补齐；path 必须 URL encode
+  const tag = encodeURIComponent(NAME);
+  const p = encodeURIComponent(WS_PATH);
+  return `vless://${UUID}@${host}:443?encryption=none&security=tls&type=ws&host=${host}&sni=${host}&path=${p}#${tag}`;
+}
 
-    if (r1.status !== 0) {
-      const cnf = path.join(BASE_DIR, 'openssl_san.cnf');
-      const cnfTxt = `[req]
-distinguished_name=req_dn
-x509_extensions=v3_req
-prompt=no
-[req_dn]
-CN=${SNI_HOST}
-[v3_req]
-subjectAltName=DNS:${SNI_HOST}
+function buildV2RayNBase64(lines) {
+  // v2rayN：把各行用 \n 拼起来，再 base64（不强制 base64url）
+  const joined = lines.join('\n') + '\n';
+  return Buffer.from(joined, 'utf8').toString('base64');
+}
+
+function buildClashMetaYaml(host) {
+  // Clash.Meta 文档要求：servername（SNI）与 ws-opts.headers.Host :contentReference[oaicite:5]{index=5}
+  const name = NAME.replace(/"/g, '\\"');
+  return `mixed-port: 7890
+allow-lan: true
+mode: rule
+log-level: info
+
+proxies:
+  - name: "${name}"
+    type: vless
+    server: ${host}
+    port: 443
+    uuid: ${UUID}
+    tls: true
+    servername: ${host}
+    network: ws
+    udp: true
+    ws-opts:
+      path: "${WS_PATH}"
+      headers:
+        Host: ${host}
+
+proxy-groups:
+  - name: "PROXY"
+    type: select
+    proxies:
+      - "${name}"
+
+rules:
+  - MATCH,PROXY
 `;
-      writeFileSecure(cnf, cnfTxt, 0o600);
+}
 
-      const r2 = runOpenSSL(
-        [
-          'req',
-          '-x509',
-          '-newkey',
-          'rsa:2048',
-          '-nodes',
-          '-keyout',
-          KEY,
-          '-out',
-          CERT,
-          '-days',
-          '3650',
-          '-config',
-          cnf,
-        ],
-        { stdio: 'ignore' }
-      );
+async function main() {
+  let currentHost = null;
 
-      if (r2.status !== 0) {
-        await fatal('failed to generate cert');
+  const server = http.createServer((req, res) => {
+    if (!currentHost) {
+      // Tunnel 还未建立：返回提示
+      if ([SUB_PATH, RAW_PATH, CLASH_PATH].includes(req.url)) {
+        res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8' });
+        res.end('Tunnel 尚未就绪，请等待控制台出现 trycloudflare 域名。\n');
         return;
       }
     }
-  }
 
-  // ===== pinSHA256 =====
-  const fp = runOpenSSL(['x509', '-noout', '-fingerprint', '-sha256', '-in', CERT], {
-    encoding: 'utf8',
-  });
-  const fpTxt = (fp.stdout || '').trim();
-  const eqIdx = fpTxt.indexOf('=');
-  const pinRaw = eqIdx >= 0 ? fpTxt.slice(eqIdx + 1).trim() : '';
-  if (!pinRaw) {
-    await fatal('failed to read sha256 fingerprint from cert');
-    return;
-  }
-  const pinEsc = encodeURIComponent(pinRaw); // ":" -> %3A
-
-  // ===== write config.yaml =====
-  const confYaml = `listen: :${PORT}
-
-tls:
-  cert: ${CERT}
-  key: ${KEY}
-  sniGuard: strict
-
-auth:
-  type: password
-  password: ${AUTH_PASS}
-`;
-  writeFileSecure(CONF, confYaml, 0o600);
-
-  // ===== host + node uri =====
-  let host = (process.env.NODE_HOST || '').trim();
-  if (!host) host = (await fetchText('https://api.ipify.org')) || '';
-  if (!host) host = 'your_host';
-
-  const uriPinned = `hy2://${AUTH_PASS}@${host}:${PORT}/?insecure=1&pinSHA256=${pinEsc}&sni=${SNI_HOST}#${NODE_NAME}`;
-  const uriBasic = `hy2://${AUTH_PASS}@${host}:${PORT}/?insecure=1&sni=${SNI_HOST}#${NODE_NAME}`;
-
-  const nodeTxt = `Pinned (recommended): ${uriPinned}
-Basic:              ${uriBasic}
-
-Notes:
-- sni/insecure/pinSHA256 are URI parameters defined by Hysteria 2 URI Scheme.
-`;
-  writeFileSecure(NODEFILE, nodeTxt, 0o600);
-
-  log(`[node] saved: ${NODEFILE}`);
-  log(`[node] pinned: ${uriPinned}`);
-  log(`[node] basic : ${uriBasic}`);
-
-  // ===== daemon loop with backoff =====
-  let child = null;
-  let stopping = false;
-
-  async function stop() {
-    if (stopping) return;
-    stopping = true;
-    log('[signal] stopping...');
-    if (child && !child.killed) {
-      try {
-        child.kill('SIGTERM');
-      } catch {}
-    } else {
-      process.exit(0);
-    }
-  }
-
-  process.on('SIGINT', stop);
-  process.on('SIGTERM', stop);
-
-  let backoff = 2;
-
-  while (true) {
-    log('[run] starting hysteria server...');
-
-    child = spawn(BIN, ['server', '-c', CONF], { stdio: ['ignore', 'pipe', 'pipe'] });
-
-    // pipe child logs to console + file (raw bytes)
-    child.stdout.on('data', (d) => {
-      process.stdout.write(d);
-      logStream.write(d);
-    });
-    child.stderr.on('data', (d) => {
-      process.stderr.write(d);
-      logStream.write(d);
-    });
-
-    const rc = await new Promise((resolve) => {
-      child.on('exit', (code, signal) => resolve({ code, signal }));
-      child.on('error', (err) => resolve({ code: 1, signal: `error:${err?.message || err}` }));
-    });
-
-    child = null;
-
-    if (stopping) {
-      process.exit(0);
+    if (req.url === RAW_PATH) {
+      const uri = buildVlessUri(currentHost);
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end(uri + '\n');
       return;
     }
 
-    log(`[run] hysteria exited (code=${rc.code} signal=${rc.signal || ''}). backoff=${backoff}s`);
-    await sleep(backoff * 1000);
-    if (backoff < 30) backoff = Math.min(backoff * 2, 30);
-  }
-})().catch(async (e) => {
-  await fatal(e?.stack || String(e));
-});
+    if (req.url === SUB_PATH) {
+      const uri = buildVlessUri(currentHost);
+      const b64 = buildV2RayNBase64([uri]);
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end(b64);
+      return;
+    }
 
+    if (req.url === CLASH_PATH) {
+      const yaml = buildClashMetaYaml(currentHost);
+      res.writeHead(200, { 'content-type': 'text/yaml; charset=utf-8' });
+      res.end(yaml);
+      return;
+    }
+
+    // 伪装成普通站点响应
+    res.writeHead(204);
+    res.end();
+  });
+
+  const wss = new WebSocketServer({
+    server,
+    path: WS_PATH,
+    perMessageDeflate: false,
+    maxPayload: 16 * 1024 * 1024
+  });
+
+  wss.on('connection', (ws) => {
+    let buffer = Buffer.alloc(0);
+    let remote = null;
+    let ready = false;
+
+    function cleanup() {
+      try { ws.close(); } catch {}
+      if (remote) {
+        try { remote.destroy(); } catch {}
+        remote = null;
+      }
+    }
+
+    ws.on('message', (data) => {
+      try {
+        const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data);
+
+        if (!ready) {
+          buffer = Buffer.concat([buffer, chunk]);
+          const parsed = tryParseVlessHeader(buffer);
+          if (!parsed) return;
+
+          const { cmd, host, port, payload } = parsed;
+          if (cmd !== 0x01) throw new Error('仅支持 TCP（cmd=0x01）');
+
+          remote = net.connect({ host, port }, () => {
+            ws.send(Buffer.from([0x00, 0x00])); // 最小响应头
+            if (payload.length) remote.write(payload);
+            ready = true;
+          });
+
+          remote.on('data', (d) => { if (ws.readyState === ws.OPEN) ws.send(d); });
+          remote.on('error', cleanup);
+          remote.on('close', cleanup);
+          return;
+        }
+
+        if (remote && remote.writable) remote.write(chunk);
+      } catch {
+        cleanup();
+      }
+    });
+
+    ws.on('close', () => { if (remote) try { remote.destroy(); } catch {} });
+    ws.on('error', () => { if (remote) try { remote.destroy(); } catch {} });
+  });
+
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`[http] listening on :${PORT}  ws=${WS_PATH}`);
+  });
+
+  // 必须 cloudflared 才能有 tunnel（无公网 IP 场景）
+  await ensureCloudflared();
+
+  const cf = spawn(CLOUDFLARED_PATH, [
+    'tunnel',
+    '--no-autoupdate',
+    '--protocol', 'http2',
+    '--url', `http://127.0.0.1:${PORT}`
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+  const onLine = (line) => {
+    const host = parseTryCloudflareHost(line);
+    if (host && host !== currentHost) {
+      currentHost = host;
+      const uri = buildVlessUri(host);
+
+      console.log('');
+      console.log('==================== 连接信息 ====================');
+      console.log(`[VLESS URI] ${uri}`);
+      console.log(`[V2RayN订阅] https://${host}${SUB_PATH}   (Base64 换行链接列表)`);
+      console.log(`[明文订阅]  https://${host}${RAW_PATH}`);
+      console.log(`[Clash.Meta] https://${host}${CLASH_PATH} (YAML)`);
+      console.log('=================================================');
+      console.log('');
+    }
+  };
+
+  cf.stdout.on('data', (d) => String(d).split('\n').forEach(onLine));
+  cf.stderr.on('data', (d) => String(d).split('\n').forEach(onLine));
+
+  cf.on('exit', (code, sig) => {
+    console.error(`[cloudflared] exited code=${code} sig=${sig}`);
+    process.exit(1);
+  });
+}
+
+main().catch((e) => {
+  console.error('[fatal]', e && e.stack ? e.stack : e);
+  process.exit(1);
+});

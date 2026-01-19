@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eu
+(set -o pipefail) 2>/dev/null && set -o pipefail
 umask 077
 
 ########################################
@@ -216,3 +217,4 @@ while true; do
   sleep "$backoff"
   if [[ "$backoff" -lt 30 ]]; then backoff=$((backoff * 2)); fi
 done
+

@@ -1,8 +1,11 @@
 {
-  "name": "hy2-runner",
+  "name": "cf-vless-ws",
   "version": "1.0.0",
-  "private": true,
+  "main": "index.js",
   "scripts": {
-    "start": "bash start.sh"
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
   }
 }

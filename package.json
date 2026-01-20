@@ -1,7 +1,7 @@
 {
-  "name": "vmess-serverless-final",
+  "name": "vmess-serverless-final-fix",
   "version": "1.0.0",
-  "description": "No-System-Command Version",
+  "description": "Final Fix with Redirect Support",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -9,8 +9,7 @@
   "dependencies": {
     "http-proxy": "^1.18.1",
     "uuid": "^9.0.0",
-    "adm-zip": "^0.5.10",
-    "axios": "^1.6.0"
+    "adm-zip": "^0.5.10"
   },
   "engines": {
     "node": ">=14.0.0"

@@ -1,12 +1,15 @@
 {
-  "name": "argo-minimal",
+  "name": "vmess-ws-info",
   "version": "1.0.0",
+  "private": true,
   "main": "index.js",
   "type": "commonjs",
-  "private": true,
-  "dependencies": {},
   "scripts": {
     "start": "node index.js"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.16",
+    "express": "^4.19.2",
+    "http-proxy": "^1.18.1"
   }
 }
-

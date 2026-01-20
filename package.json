@@ -1,15 +1,15 @@
 {
-  "name": "vmess-serverless-final",
+  "name": "vmess-serverless-robust",
   "version": "1.0.0",
-  "description": "Auto-download Xray",
+  "description": "Auto-download Xray at Runtime",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "postinstall": "curl -L -o xray.zip https://github.com/XTLS/Xray-core/releases/download/v1.8.4/Xray-linux-64.zip && unzip -o xray.zip xray && rm xray.zip && chmod +x xray"
+    "start": "node index.js"
   },
   "dependencies": {
     "http-proxy": "^1.18.1",
-    "uuid": "^9.0.0"
+    "uuid": "^9.0.0",
+    "adm-zip": "^0.5.10"
   },
   "engines": {
     "node": ">=14.0.0"

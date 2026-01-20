@@ -1,7 +1,7 @@
 {
-  "name": "vmess-serverless-robust",
+  "name": "vmess-serverless-final",
   "version": "1.0.0",
-  "description": "Auto-download Xray at Runtime",
+  "description": "Pure Node.js Xray Implementation",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"

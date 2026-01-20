@@ -1,11 +1,15 @@
 FROM node:20-bookworm-slim
 
 WORKDIR /app
-COPY package.json ./
-COPY package-lock.json* yarn.lock* ./
 
-RUN if [ -f yarn.lock ]; then corepack enable && yarn install --frozen-lockfile; \
-    else npm ci || npm install; fi
+ENV NODE_ENV=production \
+    NPM_CONFIG_CACHE=/tmp/.npm \
+    npm_config_cache=/tmp/.npm
+
+COPY package.json package-lock.json* ./
+RUN npm install --omit=dev
 
 COPY . .
-CMD ["node", "index.js"]
+
+EXPOSE 3000
+CMD ["npm","run","start"]

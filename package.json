@@ -1,11 +1,8 @@
 {
-  "name": "cf-vless-ws",
+  "name": "argo-minimal",
   "version": "1.0.0",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "dependencies": {
-    "ws": "^8.18.0"
-  }
+  "type": "commonjs",
+  "private": true,
+  "dependencies": {}
 }

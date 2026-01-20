@@ -1,13 +1,12 @@
 {
-  "name": "vmess-final-bruteforce",
+  "name": "direct-xray-final",
   "version": "1.0.0",
-  "description": "Try all architectures",
+  "description": "Direct Xray",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "http-proxy": "^1.18.1",
     "uuid": "^9.0.0",
     "adm-zip": "^0.5.10"
   },

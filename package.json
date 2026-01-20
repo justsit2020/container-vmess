@@ -2,12 +2,12 @@
   "name": "vmess-ws-cloudflared",
   "version": "1.0.0",
   "private": true,
-  "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "adm-zip": "^0.5.16",
-    "http-proxy": "^1.18.1"
+    "express": "^4.18.2",
+    "http-proxy": "^1.18.1",
+    "adm-zip": "^0.5.16"
   }
 }

@@ -1,276 +1,300 @@
-'use strict';
+const fs = require("node:fs/promises");
+const fssync = require("node:fs");
+const path = require("node:path");
+const os = require("node:os");
+const crypto = require("node:crypto");
+const { spawn } = require("node:child_process");
+const http = require("node:http");
 
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
-const { spawn } = require('child_process');
+const express = require("express");
+const httpProxy = require("http-proxy");
+const AdmZip = require("adm-zip");
 
-const PANEL_PORT = parseInt(process.env.PORT || process.env.SERVER_PORT || '7682', 10);
+// -------------------------
+// 基础配置（全部可用环境变量覆盖）
+// -------------------------
+const DATA_DIR = process.env.DATA_DIR || path.join(os.tmpdir(), "vmess-ws");
+const BIN_DIR = path.join(DATA_DIR, "bin");
+const XRAY_DIR = path.join(BIN_DIR, "xray");
+const XRAY_ZIP = path.join(XRAY_DIR, "xray.zip");
+const XRAY_BIN = path.join(XRAY_DIR, "xray");
+const XRAY_CONFIG = path.join(DATA_DIR, "config.json");
 
-// 你说环境变量不能填：把这里写死即可（必须改 UUID）
-const HARD_UUID = 'e0d103e8-a108-407f-9ec9-1c5368128833';
-const HARD_NAME = 'ARGO';
-const HARD_WS_PATH = '/vmess-407f';
+const HTTP_PORT = Number(process.env.PORT || 3000); // 平台一般用 PORT
+const XRAY_LOCAL_PORT = Number(process.env.XRAY_LOCAL_PORT || 10000); // xray 本地监听
+const WS_PATH = normalizePath(process.env.WS_PATH || "/ws");
 
-// 可选：如果你想换下载源，也可以写死在这里（留空就用默认）
-const HARD_SB_URL_AMD64 = ''; // 例如 'https://amd64.ssss.nyc.mn/sb'
-const HARD_CF_URL_AMD64 = ''; // 例如 'https://amd64.ssss.nyc.mn/2go'
-const HARD_SB_URL_ARM64 = ''; // 例如 'https://arm64.ssss.nyc.mn/sb'
-const HARD_CF_URL_ARM64 = ''; // 例如 'https://arm64.ssss.nyc.mn/2go'
+const UUID = process.env.UUID || crypto.randomUUID();
+const NODE_NAME = process.env.NODE_NAME || "vmess-ws";
+const PUBLIC_PORT = Number(process.env.PUBLIC_PORT || 443);
 
-// 实际使用：优先读环境变量，否则用写死值
-const UUID = (process.env.UUID || HARD_UUID).trim();
-const NAME = (process.env.NAME || HARD_NAME).trim();
-const WS_PATH_RAW = (process.env.WS_PATH || HARD_WS_PATH).trim() || '/vmess-argo';
-const WS_PATH = WS_PATH_RAW.startsWith('/') ? WS_PATH_RAW : `/${WS_PATH_RAW}`;
+// 信息页鉴权（强烈建议设置）
+// 如果不设置 INFO_USER/INFO_PASS，则信息页公开
+const INFO_USER = process.env.INFO_USER || "";
+const INFO_PASS = process.env.INFO_PASS || "";
 
-// 重要：下载到磁盘（/home/container），避免 /tmp(tmpfs) 导致 137
-const BASE_DIR = './';
-const BIN_DIR = path.join(BASE_DIR, 'bin');
-const SB_PATH = path.join(BIN_DIR, 'web');
-const CF_PATH = path.join(BIN_DIR, 'bot');
-const CFG_PATH = path.join(BIN_DIR, 'config.json');
+// 可选：手动指定公网域名（不指定则从请求 Host 推断）
+const PUBLIC_HOST = process.env.PUBLIC_HOST || "";
 
-let printed = false;
+// 可选：手动指定下载地址（不指定则按架构给默认）
+const XRAY_ZIP_URL = process.env.XRAY_ZIP_URL || defaultXrayZipUrl();
 
-function log(s) {
-  const line = String(s || '').trimEnd();
-  if (line) console.log(line);
-}
-function die(msg) {
-  console.error(msg);
-  process.exit(1);
-}
-
-async function ensureDir(p) {
-  await fs.promises.mkdir(p, { recursive: true });
-}
-async function exists(p) {
-  try { await fs.promises.access(p, fs.constants.F_OK); return true; } catch { return false; }
-}
-
-function archTag() {
-  const a = os.arch();
-  if (a === 'arm64' || a === 'aarch64' || a.startsWith('arm')) return 'arm64';
-  return 'amd64';
+// -------------------------
+// 工具函数
+// -------------------------
+function normalizePath(p) {
+  if (!p.startsWith("/")) p = "/" + p;
+  // 去掉尾部多余 /
+  if (p.length > 1 && p.endsWith("/")) p = p.slice(0, -1);
+  return p;
 }
 
-function getUrls() {
-  const arch = archTag();
-  if (arch === 'arm64') {
-    return {
-      sb: (process.env.SB_URL_ARM64 || HARD_SB_URL_ARM64 || 'https://arm64.ssss.nyc.mn/sb'),
-      cf: (process.env.CF_URL_ARM64 || HARD_CF_URL_ARM64 || 'https://arm64.ssss.nyc.mn/2go')
-    };
-  }
-  return {
-    sb: (process.env.SB_URL_AMD64 || HARD_SB_URL_AMD64 || 'https://amd64.ssss.nyc.mn/sb'),
-    cf: (process.env.CF_URL_AMD64 || HARD_CF_URL_AMD64 || 'https://amd64.ssss.nyc.mn/2go')
+async function ensureDir(dir) {
+  await fs.mkdir(dir, { recursive: true });
+}
+
+function basicAuthOK(req) {
+  if (!INFO_USER || !INFO_PASS) return true; // 未设置则不鉴权
+  const h = req.headers["authorization"] || "";
+  if (!h.startsWith("Basic ")) return false;
+  const raw = Buffer.from(h.slice(6), "base64").toString("utf8");
+  const [u, p] = raw.split(":");
+  return u === INFO_USER && p === INFO_PASS;
+}
+
+function requireAuth(req, res, next) {
+  if (basicAuthOK(req)) return next();
+  res.setHeader("WWW-Authenticate", 'Basic realm="Node Info"');
+  res.status(401).send("Auth required");
+}
+
+function getPublicHost(req) {
+  // 优先 env，其次 x-forwarded-host，再次 host
+  const xfHost = (req.headers["x-forwarded-host"] || "").toString().split(",")[0].trim();
+  const host = PUBLIC_HOST || xfHost || (req.headers["host"] || "").toString();
+  // 去端口
+  return host.replace(/:\d+$/, "");
+}
+
+function buildVmessLink(host) {
+  const obj = {
+    v: "2",
+    ps: NODE_NAME,
+    add: host,
+    port: String(PUBLIC_PORT),
+    id: UUID,
+    aid: "0",
+    scy: "auto",
+    net: "ws",
+    type: "none",
+    host: host,
+    path: WS_PATH,
+    tls: "tls"
   };
+  return "vmess://" + Buffer.from(JSON.stringify(obj), "utf8").toString("base64");
 }
 
-// 关键：启动前清理历史垃圾，给磁盘腾空间（你不能敲命令，就让脚本做）
-async function cleanupHeavyFiles() {
-  const targets = [
-    path.join(BASE_DIR, 'node_modules'),
-    path.join(BASE_DIR, '.npm'),
-    path.join(BASE_DIR, '.runtime'),
-    path.join(BASE_DIR, 'package-lock.json'),
-    path.join(BASE_DIR, 'boot.log'),
-    path.join(BASE_DIR, 'list.txt'),
-    path.join(BASE_DIR, 'web'),
-    path.join(BASE_DIR, 'bot'),
-    path.join(BASE_DIR, 'frpc'),
-  ];
-
-  for (const t of targets) {
-    try {
-      await fs.promises.rm(t, { recursive: true, force: true });
-    } catch {}
-  }
+function buildSub(host) {
+  const links = [buildVmessLink(host)];
+  const raw = links.join("\n");
+  // 兼容常见客户端订阅格式：base64(links)
+  return Buffer.from(raw, "utf8").toString("base64");
 }
 
-// 用 curl 下载到磁盘文件，避免 Node fetch 造成额外内存压力
-function downloadWithCurl(url, outPath) {
-  return new Promise((resolve, reject) => {
-    const tmp = `${outPath}.tmp`;
-    const args = [
-      '-L', '--fail', '--retry', '2',
-      '--connect-timeout', '10', '--max-time', '300',
-      '--silent', '--show-error',
-      '-o', tmp,
-      url
-    ];
-
-    const p = spawn('curl', args, { stdio: ['ignore', 'ignore', 'pipe'] });
-
-    let err = '';
-    p.stderr.on('data', d => err += d.toString('utf8'));
-
-    p.on('exit', async (code) => {
-      if (code !== 0) {
-        return reject(new Error(`curl failed code=${code}: ${err.trim()}`));
-      }
-      try {
-        await fs.promises.rename(tmp, outPath);
-        await fs.promises.chmod(outPath, 0o755);
-        resolve();
-      } catch (e) {
-        reject(e);
-      }
-    });
+async function downloadToFile(url, filepath) {
+  const res = await fetch(url, { redirect: "follow" });
+  if (!res.ok) throw new Error(`Download failed: ${res.status} ${res.statusText}`);
+  await ensureDir(path.dirname(filepath));
+  const file = fssync.createWriteStream(filepath);
+  await new Promise((resolve, reject) => {
+    res.body.pipe(file);
+    res.body.on("error", reject);
+    file.on("finish", resolve);
+    file.on("error", reject);
   });
 }
 
-async function ensureBinaries() {
-  await ensureDir(BIN_DIR);
-  const { sb, cf } = getUrls();
+async function ensureXray() {
+  await ensureDir(XRAY_DIR);
 
-  if (!(await exists(SB_PATH))) {
-    log(`[init] downloading core -> ${SB_PATH}`);
-    await downloadWithCurl(sb, SB_PATH);
-  } else {
-    log(`[init] core exists -> ${SB_PATH}`);
+  // 已存在就不重复下载
+  if (fssync.existsSync(XRAY_BIN)) return;
+
+  console.log(`[init] Xray not found, downloading...`);
+  console.log(`[init] XRAY_ZIP_URL=${XRAY_ZIP_URL}`);
+
+  await downloadToFile(XRAY_ZIP_URL, XRAY_ZIP);
+
+  const zip = new AdmZip(XRAY_ZIP);
+  zip.extractAllTo(XRAY_DIR, true);
+
+  // 有的包解压出来叫 xray，有的可能在子目录里，兜底搜一下
+  if (!fssync.existsSync(XRAY_BIN)) {
+    const found = findFileRecursive(XRAY_DIR, "xray");
+    if (!found) throw new Error("xray binary not found after unzip");
+    await fs.copyFile(found, XRAY_BIN);
   }
 
-  if (!(await exists(CF_PATH))) {
-    log(`[init] downloading cloudflared -> ${CF_PATH}`);
-    await downloadWithCurl(cf, CF_PATH);
-  } else {
-    log(`[init] cloudflared exists -> ${CF_PATH}`);
-  }
+  await fs.chmod(XRAY_BIN, 0o755);
+  console.log(`[init] Xray ready: ${XRAY_BIN}`);
 }
 
-function buildConfig() {
-  // 核心只监听本机 + 面板唯一端口；cloudflared 再把它暴露出去
-  return {
-    log: { disabled: true },
+function findFileRecursive(dir, filename) {
+  const entries = fssync.readdirSync(dir, { withFileTypes: true });
+  for (const e of entries) {
+    const full = path.join(dir, e.name);
+    if (e.isFile() && e.name === filename) return full;
+    if (e.isDirectory()) {
+      const r = findFileRecursive(full, filename);
+      if (r) return r;
+    }
+  }
+  return null;
+}
+
+async function writeXrayConfig() {
+  const cfg = {
+    log: { loglevel: "warning" },
     inbounds: [
       {
-        tag: 'vmess-ws',
-        type: 'vmess',
-        listen: '127.0.0.1',
-        listen_port: PANEL_PORT,
-        users: [{ uuid: UUID }],
-        transport: { type: 'ws', path: WS_PATH }
-      }
-    ],
-    outbounds: [{ type: 'direct', tag: 'direct' }],
-    route: { rules: [], final: 'direct' }
-  };
-}
-
-function buildVmessNode(domain) {
-  const json = {
-    v: '2',
-    ps: NAME,
-    add: domain,
-    port: '443',
-    id: UUID,
-    aid: '0',
-    net: 'ws',
-    type: 'none',
-    host: domain,
-    path: WS_PATH,
-    tls: 'tls',
-    sni: domain
-  };
-  return `vmess://${Buffer.from(JSON.stringify(json)).toString('base64')}`;
-}
-
-function extractTryDomain(line) {
-  const m = line.match(/https?:\/\/([a-z0-9-]+\.trycloudflare\.com)/i);
-  return m && m[1] ? m[1] : '';
-}
-
-function childEnv() {
-  // 避免 cloudflared 在 /home/container 写多余配置；但二进制仍在 /home/container/bin
-  const env = { ...process.env };
-  env.HOME = '/tmp'; // 小文件写到 /tmp
-  env.XDG_CONFIG_HOME = '/tmp/xdg/config';
-  env.XDG_CACHE_HOME = '/tmp/xdg/cache';
-  env.XDG_DATA_HOME = '/tmp/xdg/data';
-  return env;
-}
-
-function startCore() {
-  const p = spawn(SB_PATH, ['run', '-c', CFG_PATH], {
-    cwd: BIN_DIR,
-    env: childEnv(),
-    stdio: ['ignore', 'ignore', 'pipe']
-  });
-
-  p.stderr.on('data', d => {
-    const s = d.toString('utf8').trim();
-    if (s) log(`[core] ${s}`);
-  });
-
-  p.on('exit', (code, sig) => log(`[core] exited code=${code} sig=${sig || ''}`));
-  log(`[init] core started 127.0.0.1:${PANEL_PORT} ws=${WS_PATH}`);
-  return p;
-}
-
-function startArgo() {
-  const args = [
-    'tunnel',
-    '--edge-ip-version', 'auto',
-    '--no-autoupdate',
-    '--protocol', 'http2',
-    '--url', `http://127.0.0.1:${PANEL_PORT}`
-  ];
-
-  const p = spawn(CF_PATH, args, {
-    cwd: BIN_DIR,
-    env: childEnv(),
-    stdio: ['ignore', 'pipe', 'pipe']
-  });
-
-  const onLine = (buf) => {
-    const s = buf.toString('utf8');
-    s.split(/\r?\n/).forEach((line) => {
-      if (!line) return;
-
-      if (!printed) {
-        const d = extractTryDomain(line);
-        if (d) {
-          printed = true;
-          log(`[init] argo domain = ${d}`);
-          log(`[node] ${buildVmessNode(d)}`);
-          log(`[note] 复制上面这一行 vmess:// 到客户端即可`);
+        listen: "127.0.0.1",
+        port: XRAY_LOCAL_PORT,
+        protocol: "vmess",
+        settings: {
+          clients: [{ id: UUID, alterId: 0 }]
+        },
+        streamSettings: {
+          network: "ws",
+          wsSettings: { path: WS_PATH }
         }
       }
-    });
+    ],
+    outbounds: [{ protocol: "freedom" }]
   };
 
-  // trycloudflare 域名经常在 stderr 输出，所以两边都解析
-  p.stdout.on('data', onLine);
-  p.stderr.on('data', onLine);
+  await ensureDir(path.dirname(XRAY_CONFIG));
+  await fs.writeFile(XRAY_CONFIG, JSON.stringify(cfg, null, 2), "utf8");
+  console.log(`[init] Wrote Xray config: ${XRAY_CONFIG}`);
+}
 
-  p.on('exit', (code, sig) => log(`[argo] exited code=${code} sig=${sig || ''}`));
+function startXray() {
+  console.log(`[start] starting xray on 127.0.0.1:${XRAY_LOCAL_PORT} ws:${WS_PATH}`);
+  const p = spawn(XRAY_BIN, ["run", "-config", XRAY_CONFIG], {
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+
+  p.stdout.on("data", (d) => process.stdout.write(`[xray] ${d}`));
+  p.stderr.on("data", (d) => process.stderr.write(`[xray] ${d}`));
+  p.on("exit", (code, signal) => {
+    console.error(`[xray] exited code=${code} signal=${signal}`);
+    // 让主进程退出，平台会重启
+    process.exit(code || 1);
+  });
+
   return p;
 }
 
-async function main() {
-  if (!UUID || UUID.includes('把这里换成')) {
-    die('[fatal] 你没有把 HARD_UUID 改成真实 UUID。');
+function defaultXrayZipUrl() {
+  // 这些文件名在很多安装/解压文档与镜像中使用：Xray-linux-64.zip / Xray-linux-arm64-v8a.zip :contentReference[oaicite:1]{index=1}
+  // 官方发布在 GitHub Releases。 :contentReference[oaicite:2]{index=2}
+  const arch = process.arch; // x64 / arm64
+  if (arch === "arm64") {
+    return "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-arm64-v8a.zip";
   }
-
-  // 先清理，避免磁盘超限（你无法手动 rm）
-  await cleanupHeavyFiles();
-
-  // 下载（到 /home/container/bin）
-  await ensureBinaries();
-
-  // 写配置（很小）
-  await fs.promises.writeFile(CFG_PATH, JSON.stringify(buildConfig()), 'utf8');
-
-  startCore();
-  startArgo();
-
-  // 保活，避免面板误判“无输出=卡死”
-  setInterval(() => log('[keep] alive'), 30000).unref();
+  // 默认 x64
+  return "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip";
 }
 
-main().catch(e => die(e && e.stack ? e.stack : String(e)));
+// -------------------------
+// 主流程
+// -------------------------
+async function main() {
+  // 全部写到 /tmp，避免 EACCES（你现在就是卡在 /root 写入权限）
+  await ensureDir(DATA_DIR);
+  await ensureDir(BIN_DIR);
 
+  await ensureXray();
+  await writeXrayConfig();
+  startXray();
 
+  // HTTP + WS 反代
+  const app = express();
+
+  app.get("/healthz", (req, res) => res.status(200).send("ok"));
+
+  app.get("/", (req, res) => {
+    res
+      .status(200)
+      .type("html")
+      .send(`
+        <h3>Service is running</h3>
+        <ul>
+          <li><a href="/info">/info</a> (JSON)</li>
+          <li><a href="/sub">/sub</a> (base64 subscription)</li>
+        </ul>
+        <p>WS endpoint: <code>${WS_PATH}</code></p>
+      `);
+  });
+
+  app.get("/info", requireAuth, (req, res) => {
+    const host = getPublicHost(req);
+    const vmess = buildVmessLink(host);
+    res.json({
+      name: NODE_NAME,
+      host,
+      publicPort: PUBLIC_PORT,
+      wsPath: WS_PATH,
+      uuid: UUID,
+      vmess
+    });
+  });
+
+  app.get("/sub", requireAuth, (req, res) => {
+    const host = getPublicHost(req);
+    const b64 = buildSub(host);
+    res.type("text/plain").send(b64);
+  });
+
+  const server = http.createServer(app);
+
+  const proxy = httpProxy.createProxyServer({
+    target: `http://127.0.0.1:${XRAY_LOCAL_PORT}`,
+    ws: true
+  });
+
+  proxy.on("error", (err, req, res) => {
+    console.error("[proxy] error:", err?.message || err);
+    try {
+      if (res && !res.headersSent) res.writeHead(502);
+      res && res.end("Bad gateway");
+    } catch (_) {}
+  });
+
+  server.on("upgrade", (req, socket, head) => {
+    // 只把 WS_PATH 的 upgrade 转给 xray，其他直接断开
+    if (!req.url || !req.url.startsWith(WS_PATH)) {
+      socket.destroy();
+      return;
+    }
+    proxy.ws(req, socket, head);
+  });
+
+  server.listen(HTTP_PORT, () => {
+    console.log(`[http] listening on :${HTTP_PORT}`);
+    console.log(`[http] ws path: ${WS_PATH}`);
+    if (INFO_USER && INFO_PASS) {
+      console.log(`[http] /info & /sub are protected by Basic Auth (INFO_USER/INFO_PASS)`);
+    } else {
+      console.warn(`[http] WARNING: /info & /sub are PUBLIC. Set INFO_USER/INFO_PASS to protect them.`);
+    }
+    // 启动时先打印一个“占位链接”（host 需要你真实域名或首次请求才能确定）
+    const placeholderHost = PUBLIC_HOST || "YOUR_DOMAIN";
+    console.log(`[node] vmess link (placeholder host):\n${buildVmessLink(placeholderHost)}\n`);
+    console.log(`[node] open https://${placeholderHost}/info to get the real link (or set PUBLIC_HOST).`);
+  });
+}
+
+main().catch((e) => {
+  console.error("[fatal]", e);
+  process.exit(1);
+});

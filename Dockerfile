@@ -1,25 +1,22 @@
 FROM node:alpine
 
-# 安装必要工具
-RUN apk add --no-cache curl unzip
+# 关键：安装 wget 和 unzip 以便在构建时下载核心
+RUN apk add --no-cache curl wget unzip
 
 WORKDIR /app
 
-# 先复制 package.json，利用 Docker 缓存加速构建
+# 先拷贝 package.json 并安装依赖
 COPY package.json .
-
-# [...](asc_slot://start-slot-7)安装依赖 (这步会安装 http-proxy)
 RUN npm install
 
-# 下载 Xray 核心 (以 Linux 64位为例)
+# 关键步骤：在构建镜像时就下载并安装好 Xray，不要留到 index.js 去做
 RUN wget -q https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip && \
     unzip -q Xray-linux-64.zip && \
     mv xray /usr/bin/xray && \
     chmod +x /usr/bin/xray && \
     rm -f Xray-linux-64.zip *.dat *.json
 
-# [...](asc_slot://start-slot-9)复制其余代码
+# 拷贝剩余代码
 COPY . .
 
-# 启动
 CMD ["npm", "start"]

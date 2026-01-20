@@ -1,7 +1,7 @@
 {
-  "name": "vmess-serverless-auto-arch",
+  "name": "vmess-final-bruteforce",
   "version": "1.0.0",
-  "description": "Auto Detect Architecture",
+  "description": "Try all architectures",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"

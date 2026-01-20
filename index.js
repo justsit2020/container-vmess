@@ -6,51 +6,66 @@ const httpProxy = require('http-proxy');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const AdmZip = require('adm-zip');
+const os = require('os');
 
-// --- 配置 ---
+// --- 基础配置 ---
 const PORT = process.env.PORT || 3000;
 const UUID = process.env.UUID || uuidv4();
 const NESTED_PATH = process.env.VMESS_PATH || '/vmess';
-const DOWNLOAD_URL = 'https://github.com/XTLS/Xray-core/releases/download/v1.8.4/Xray-linux-64.zip';
 const TMP_DIR = '/tmp';
 const XRAY_BIN = path.join(TMP_DIR, 'xray');
 const CONFIG_FILE = path.join(TMP_DIR, 'config.json');
 
+console.log(`[Init] 系统架构: ${os.arch()} | 平台: ${os.platform()}`);
 console.log(`[Init] 准备启动... UUID: ${UUID}`);
 
-// --- 核心修复：支持重定向的下载函数 ---
+// --- 1. 智能获取下载链接 ---
+function getDownloadUrl() {
+  const arch = os.arch();
+  let filename = '';
+  
+  if (arch === 'x64') {
+    filename = 'Xray-linux-64.zip';
+  } else if (arch === 'arm64') {
+    filename = 'Xray-linux-arm64-v8a.zip'; // 适配 ARM 环境
+  } else {
+    console.error(`[Fatal] 不支持的架构: ${arch}`);
+    process.exit(1);
+  }
+  
+  const url = `https://github.com/XTLS/Xray-core/releases/download/v1.8.4/${filename}`;
+  console.log(`[Init] 根据架构自动选择版本: ${filename}`);
+  return url;
+}
+
+// --- 2. 支持重定向的下载函数 ---
 function downloadFile(url, dest) {
   return new Promise((resolve, reject) => {
     const get = (link) => {
-      console.log(`[Download] 正在请求: ${link}`);
       https.get(link, (res) => {
-        // 处理 302/301 重定向 (关键修复)
+        // 处理 302 重定向
         if (res.statusCode === 302 || res.statusCode === 301) {
           if (res.headers.location) {
-            console.log(`[Download] 检测到跳转，正在跟随...`);
+            console.log(`[Download] 跟随跳转 -> ${res.headers.location.substring(0, 50)}...`);
             return get(res.headers.location);
           }
         }
         
         if (res.statusCode !== 200) {
-          return reject(new Error(`下载失败，状态码: ${res.statusCode}`));
+          return reject(new Error(`下载失败 HTTP ${res.statusCode}`));
         }
 
         const file = fs.createWriteStream(dest);
         res.pipe(file);
         
         file.on('finish', () => {
-          file.close(() => {
-            console.log(`[Download] 文件写入完成`);
-            resolve();
-          });
+          file.close(resolve);
         });
       }).on('error', (err) => {
-        fs.unlink(dest, () => {}); // 删除下载失败的文件
+        fs.unlink(dest, () => {});
         reject(err);
       });
     };
-    
     get(url);
   });
 }
@@ -58,25 +73,26 @@ function downloadFile(url, dest) {
 // --- 主程序 ---
 async function startServer() {
   try {
-    // 1. 安装 Xray
+    // 检查并安装
     if (!fs.existsSync(XRAY_BIN)) {
-      console.log(`[Init] 开始下载 Xray...`);
+      const downloadUrl = getDownloadUrl();
       const zipPath = path.join(TMP_DIR, 'xray.zip');
       
-      // 使用修复后的下载函数
-      await downloadFile(DOWNLOAD_URL, zipPath);
+      console.log(`[Init] 正在下载核心...`);
+      await downloadFile(downloadUrl, zipPath);
       
-      console.log(`[Init] 正在解压...`);
+      console.log(`[Init] 下载完成，正在解压...`);
       const zip = new AdmZip(zipPath);
-      zip.extractAllTo(TMP_DIR, true); // 解压到 /tmp
+      zip.extractAllTo(TMP_DIR, true);
       
-      fs.chmodSync(XRAY_BIN, 0o755); // 赋予执行权限
-      console.log(`[Init] 安装成功！`);
+      // 赋予执行权限
+      fs.chmodSync(XRAY_BIN, 0o755);
+      console.log(`[Init] 核心安装完毕！`);
       
-      fs.unlinkSync(zipPath); // 清理
+      fs.unlinkSync(zipPath);
     }
 
-    // 2. 写入配置
+    // 生成配置
     const config = {
       "log": { "loglevel": "warning" },
       "inbounds": [{
@@ -93,8 +109,8 @@ async function startServer() {
     };
     fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
 
-    // 3. 启动 Xray
-    console.log(`[Start] 启动 Xray 进程...`);
+    // 启动 Xray
+    console.log(`[Start] 启动 Xray...`);
     const xray = spawn(XRAY_BIN, ['-c', CONFIG_FILE]);
 
     xray.stdout.on('data', (data) => console.log(`[Xray] ${data}`));
@@ -104,12 +120,12 @@ async function startServer() {
       process.exit(code);
     });
 
-    // 4. HTTP 代理服务
+    // 启动代理服务
     const proxy = httpProxy.createProxyServer({});
     const server = http.createServer((req, res) => {
       if (req.url === '/') {
         res.writeHead(200);
-        res.end('Leapcell Service Running!');
+        res.end(`Service Running on ${os.arch()}`);
       } else if (req.url.startsWith(NESTED_PATH)) {
         proxy.web(req, res, { target: 'http://127.0.0.1:10000' });
       } else {
@@ -127,11 +143,11 @@ async function startServer() {
     });
 
     server.listen(PORT, () => {
-      console.log(`[Server] 监听端口 ${PORT}`);
+      console.log(`[Server] 服务已启动，端口 ${PORT}`);
     });
 
   } catch (err) {
-    console.error(`[Fatal] 发生错误:`, err);
+    console.error(`[Fatal] 错误:`, err);
     process.exit(1);
   }
 }
